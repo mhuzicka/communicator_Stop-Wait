@@ -16,7 +16,7 @@ sequence_number_global = 1
 class communication_node():
     """This class is used to create a listener or a sender."""
     def __init__(self, IP_address: str, listening_port: int) -> None:
-        self.ustdin = [] # user standard input
+        self.ustdin = [] # user standard input (Citanie z CLI)
         self.input_running = False
 
         self.my_IP = IP_address
@@ -46,6 +46,8 @@ class communication_node():
 
 
     def node_main(self) -> None:
+        """ Tato funkcia funguje ako while loop, v ktorom \"existuje\" uzol.
+        Nastavuje hodnoty, ktore je potrebne zmit v pripade switchu."""
         while True:
             self.wants_to_change = False
 
@@ -78,7 +80,7 @@ class communication_node():
             if (user_input == 'l'):
                 self.is_listener = True
                 self.is_sender = False
-                t_listener = threading.Thread(target=self.node_listener, args=[])
+                t_listener = threading.Thread(target=self.listener_node, args=[])
                 t_listener.start()
             
             #sender
@@ -89,7 +91,7 @@ class communication_node():
                     self.their_IP = input("Enter reciever IP: ")
                     self.their_port = int(input("Enter reciever port: "))
 
-                t_sender = threading.Thread(target=self.create_session, args=[self.their_IP, self.their_port])
+                t_sender = threading.Thread(target=self.sender_node, args=[self.their_IP, self.their_port])
                 t_healthcheck = threading.Thread(target=self.healthcheck, args=[self.their_IP, self.their_port])
                 
                 t_sender.start()
@@ -111,6 +113,7 @@ class communication_node():
 
 
     def std_input(self) -> None:
+        """Hlavne vlakno vstupi do tejto funkcie a spracuva input z CLI."""
         self.input_running = True
 
         while True:
@@ -164,20 +167,23 @@ class communication_node():
                 self.ustdin.insert(0, stdin)
 
 
-    def create_session(self, reciever_UDP_IP: str, reciever_UDP_PORT: int) -> None:
+    def sender_node(self, reciever_UDP_IP: str, reciever_UDP_PORT: int) -> None:
+        """Bezi v samostatnom vlakne a predstavuje \'klienta\' v komunikacii."""
         global sequence_number_global
         cin = ""
         send_buffer = b''
 
         while not self.stop_sender.is_set():
-            print("MSG|FILE|ACK|NACK|PING|CUSTOM|ERRMSG|ERRFILE\n>>", end='')
+            print("MSG|FILE|NACK|PING|CUSTOM|ERRMSG|ERRFILE\n>>", end='')
 
+            # Kym nie je user input, pocuva odpovede na healthchecky, NACK spravy a poziadavky na switch
             while not len(self.ustdin):
                 self.listen_for_healthchecks()
 
                 if self.stop_sender.is_set():
                     exit()
             
+            # Caka na typ spravy, ktory sa ma odoslat
             cin = self.__await_input()
 
             if cin == "MSG" or cin == "ERRMSG":
@@ -219,10 +225,6 @@ class communication_node():
                 self.sock.sendto(send.get_datagram(), (reciever_UDP_IP, reciever_UDP_PORT))
                 self.initialized_termination.set()
             
-            elif cin == "ACK":
-                send = protocol(sequence_number_global, cin)
-                self.sock.sendto(send.get_datagram(), (reciever_UDP_IP, reciever_UDP_PORT))
-            
             elif cin == "CUSTOM":
                 sequence_cust = int(self.__await_input("Sequence number"))
                 type_cust = self.__await_input("Message type (only ACK|NACK|MSG|FILE)")
@@ -243,28 +245,36 @@ class communication_node():
             else:
                 continue
 
+            fragments_sent_total = 1
+
             # RETRANSMISSION of first datagram
-            while True:
+            while cin != "PING":
                 if self.stop_sender.is_set():
                     exit()
 
                 # listening for ACK as well as handling retransmissions
-                if self.listen_for_ack(reciever_UDP_IP, reciever_UDP_PORT, send):
+                if self.listen_for_ack(reciever_UDP_IP, reciever_UDP_PORT, send, fragments_sent_total):
                     break
                 else:
                     exit()
             
             self.connected = True
 
+            # Zapnutie healthcheckera
+            if self.wait_healthchecker.is_set():
+                self.wait_healthchecker.clear()
+
             # Pridanie chyby
             if cin.startswith("ERR"):
-                print("Error on which fragment (2-2047)?\n>> ", end='')
-                error_frag = int(self.__await_input())
+                error_frag = int(self.__await_input("Error on which fragment (2-2047)?"))
                 cin = "MSG" if cin == "ERRMSG" else "FILE"
             else:
                 error_frag = -1
 
-            # sending fragments
+            if len(send_buffer) == 0:
+                last_frag_size = len(send.data) + 4
+
+            # sending remaining fragments
             while len(send_buffer):
                 if self.stop_sender.is_set():
                     exit()
@@ -277,28 +287,35 @@ class communication_node():
                     send = protocol(sequence_number_global, cin, data_to_send, 1)
                 else:
                     send = protocol(sequence_number_global, cin, data_to_send, 1, 0, 1)
+                    last_frag_size = len(send.data) + 4
                 
                 if sequence_number_global == error_frag:
-                    bad_send = protocol(sequence_number_global, cin, data_to_send, 1, custom_chsum=12)
+                    bad_send = protocol(sequence_number_global, cin, bytes("AAA", "utf8"), 1, custom_chsum=12)
                     self.sock.sendto(bad_send.get_datagram(), (reciever_UDP_IP, reciever_UDP_PORT))
                     error_frag = -1
                 else:
                     self.sock.sendto(send.get_datagram(), (reciever_UDP_IP, reciever_UDP_PORT))
                 
+                fragments_sent_total += 1
+                
                 # RETRANSMISSION
-                if not self.listen_for_ack(reciever_UDP_IP, reciever_UDP_PORT, send):
+                if not self.listen_for_ack(reciever_UDP_IP, reciever_UDP_PORT, send, fragments_sent_total):
                     exit()
             
             increment_global_sequence()
-            print("Next sequence:", sequence_number_global)
+            if fragments_sent_total > 1:
+                print("Total fragments sent:", fragments_sent_total,
+                    "\nSize of fragments:", get_fragment_size() + 4,
+                    "B (Size of the last fragment was", last_frag_size, "B)\n")
+            else:
+                print("Total fragments sent:", fragments_sent_total,
+                    " | Size of the fragment was", last_frag_size, "B\n")
 
-            if self.wait_healthchecker.is_set():
-                self.wait_healthchecker.clear()
+            error_frag = -1
     
 
     def healthcheck(self, reciever_UDP_IP: str, reciever_UDP_PORT: int) -> None:
-        counter = 0
-
+        """Bezi v samostatnom vlakne a sluzi na posielanie keep-alive sprav (healthcheck)."""
         while not self.stop_healthchecker.is_set():
             # Posielanie healthcheckov sa da pozastavit
             while self.wait_healthchecker.is_set():
@@ -307,6 +324,7 @@ class communication_node():
                     exit()
                 continue
             
+            counter = 0
             # Ak druha strana dlho neodpoveda na healthcheck
             while self.not_responding.is_set():
                 self.sock.sendto(protocol(0, "MSG").get_datagram(), (reciever_UDP_IP, reciever_UDP_PORT))
@@ -330,7 +348,8 @@ class communication_node():
             time.sleep(5)
         
     
-    def listen_for_ack(self, reciever_UDP_IP: str, reciever_UDP_PORT: int, send: protocol) -> bool:
+    def listen_for_ack(self, reciever_UDP_IP: str, reciever_UDP_PORT: int, send: protocol, total_frags: int) -> bool:
+        """Prijimac pre klienta, ktory je schopny znova odoslat zle prijaty/neprijaty fragment."""
         retransmission_count = 0
         time_start = time.time()
 
@@ -374,6 +393,7 @@ class communication_node():
                     print("Retransmitting", send.sequence)
                     self.sock.sendto(send.get_datagram(), (reciever_UDP_IP, reciever_UDP_PORT))
                     retransmission_count += 1
+                    total_frags += 1
                     if retransmission_count == 10:
                         self.__stop_threads()
                         print("Retransmit Limit reached for", send.sequence, "\nTerminating connection...")
@@ -391,6 +411,7 @@ class communication_node():
                 print("Retransmitting", send.sequence)
                 self.sock.sendto(send.get_datagram(), (reciever_UDP_IP, reciever_UDP_PORT))
                 retransmission_count += 1
+                total_frags += 1
 
                 if retransmission_count == 10:
                     self.__stop_threads()
@@ -401,11 +422,13 @@ class communication_node():
     
     
     def listen_for_healthchecks(self) -> None:
+        """Prijimac pre klienta"""
         ready, _, _ = select.select([self.sock], [], [], 0.5)
 
         if not self.not_responding.is_set() and not self.stop_sender.is_set():
-            if elapsed_time_seconds(self.last_healthcheck_success) > 10 and not self.wait_healthchecker:
-                print("\nAttemting reconnection...")
+            if (self.last_healthcheck_success != 0 and elapsed_time_seconds(self.last_healthcheck_success) > 10
+                and not self.wait_healthchecker.is_set()):
+                print("\nAttempting reconnection...")
                 self.not_responding.set()
         
         if ready:
@@ -449,11 +472,11 @@ class communication_node():
                 self.wants_to_change = True
 
 
-    def node_listener(self) -> None:
+    def listener_node(self) -> None:
+        """Bezi v samostatnom vlakne, predstavuje \'server\'"""
         message_buffer = b''
         file_buffer = b''
-        file_buffer_bytes = 0
-        message_buffer_bytes = 0
+        fragment_length = 0
         num_of_fragments_recieved = 0
         fragments_await = False
 
@@ -534,50 +557,75 @@ class communication_node():
 
                 # recieving file
                 elif (recieve_protocol.data_type == "FILE"):
+                    # Pripravi sa na to, ze sa budu prichadzat fragmentovane data
                     if recieve_protocol.first_fragment:
                         file_buffer = b''
                         num_of_fragments_recieved = 0
-                        file_buffer_bytes = 0
+                        last_frag_num = recieve_protocol.sequence
                         fragments_await = True
                     
+                    elif fragments_await :
+                        # Nesedi sequence number, alebo uz prijal tieto data
+                        if (recieve_protocol.sequence <= last_frag_num and last_frag_num != 2047 and recieve_protocol.sequence != 1):
+                            self.sock.sendto(protocol(recieve_protocol.sequence, "ACK").get_datagram(), client_address)
+                            continue
+                        last_frag_num = recieve_protocol.sequence
+
+
                     if not fragments_await and recieve_protocol.fragmented:
                         self.sock.sendto(protocol(recieve_protocol.sequence, "NACK").get_datagram(), client_address)
                         continue
-                    
+
+
                     file_buffer += recieve_protocol.data
                     self.sock.sendto(protocol(recieve_protocol.sequence, "ACK").get_datagram(), client_address)
                     num_of_fragments_recieved += 1
-                    file_buffer_bytes += len(recieve_protocol.data)
+
+                    if fragment_length == 0:
+                        fragment_length = len(recieve_protocol.data) + 4
 
                     if(recieve_protocol.last_fragment and fragments_await or not recieve_protocol.fragmented):
-                        self.__file_recieved(file_buffer, num_of_fragments_recieved, file_buffer_bytes)
+                        last_frag_size = len(recieve_protocol.data) + 4
+                        self.__file_recieved(file_buffer, num_of_fragments_recieved, fragment_length, last_frag_size)
                         file_buffer = b''
                         num_of_fragments_recieved = 0
-                        file_buffer_bytes = 0
+                        fragment_length = 0
                         fragments_await = False
                 
                 # recieving text message
                 elif (recieve_protocol.data_type == "MSG"):
+                    # Pripravi sa na to, ze sa budu prichadzat fragmentovane data
                     if recieve_protocol.first_fragment:
                         message_buffer = b''
                         num_of_fragments_recieved = 0
-                        message_buffer_bytes = 0
+                        last_frag_num = recieve_protocol.sequence
                         fragments_await = True
                     
+                    elif fragments_await :
+                        # Nesedi sequence number, alebo uz prijal tieto data
+                        if (recieve_protocol.sequence <= last_frag_num and last_frag_num != 2047 and recieve_protocol.sequence != 1):
+                            self.sock.sendto(protocol(recieve_protocol.sequence, "ACK").get_datagram(), client_address)
+                            continue
+                        last_frag_num = recieve_protocol.sequence
+                    
+
                     message_buffer += recieve_protocol.data
                     self.sock.sendto(protocol(recieve_protocol.sequence, "ACK").get_datagram(), client_address)
                     num_of_fragments_recieved += 1
-                    message_buffer_bytes += len(recieve_protocol.data)
+                    
+                    if fragment_length == 0:
+                        fragment_length = len(recieve_protocol.data) + 4
 
-                    # vypise spravu az ked pridu vsetky packety, alebo ak nie je fragmentovana
                     if(recieve_protocol.last_fragment and fragments_await or not recieve_protocol.fragmented):
-                        fragments_await = False
-                        print("\nReceiving from:", client_address[0], "on port:", client_address[1],
-                            "\nFragments recieved:", num_of_fragments_recieved, " |  Bytes:", message_buffer_bytes,
-                            "\n Data:", message_buffer.decode("utf8"), "\n")
+                        print("\nRecieving from:", client_address[0], "on port:", client_address[1],
+                            "\nFragments recieved:", num_of_fragments_recieved, " | Total bytes:", len(message_buffer),
+                            "(payload only)\nSize of fragments:", fragment_length, "B (Size of the last fragment was",
+                            len(recieve_protocol.data) + 4, "B)\nData:\n", message_buffer.decode("utf8"), "\n")
+                    
                         message_buffer = b''
                         num_of_fragments_recieved = 0
-                        message_buffer_bytes = 0
+                        fragment_length = 0
+                        fragments_await = False
                 
                 # ACK to sent data
                 elif (recieve_protocol.data_type == "ACK"):
@@ -596,9 +644,11 @@ class communication_node():
             time.sleep(0.2)
 
 
-    def __file_recieved(self, file_buffer: bytes, num_of_fragments_recieved: int, file_buffer_bytes: int) -> None:
-        print("Recieved file (", num_of_fragments_recieved, " fragments; ",
-              file_buffer_bytes, " bytes recieved)", sep='')
+    def __file_recieved(self, file_buffer: bytes, num_of_fragments_recieved: int, frag_size: int, last_frag_size: int) -> None:
+        """Spracuje prijate udaje a vytvori docasny subor s nazvom \'buffered_file_temp\'."""
+        print("Recieved file: ", num_of_fragments_recieved, " fragments; ",
+              len(file_buffer), " bytes recieved (payload only)\nFragment size: ", frag_size, 
+              " B (Last fragment was ", last_frag_size, " B)", sep='')
 
         splitted_data = file_buffer.split(b'\n', 1)
         filename = splitted_data[0].decode("utf8")
@@ -615,10 +665,10 @@ class communication_node():
 
 
     def __file_save(self, filename: str) -> None:
-        """Must be run in a separate thread!"""
+        """Bezi v samostatnom vlakne a prijaty subor presunie na miesto urcene pouzivatelom."""
 
         while True:
-            print("Recieved file. Where to save it? Its file name was", filename,
+            print("Where to save it? Its file name was", filename,
                   "\n>> ", end='')
             while len(self.location) == 0:
                 time.sleep(1)
@@ -642,6 +692,7 @@ class communication_node():
     
 
     def __stop_threads(self) -> None:
+        """Posle signal vsetkym vlaknam, aby sa ukoncili."""
         if not self.stop_listener.is_set():
             self.stop_listener.set()
         if not self.stop_healthchecker.is_set():

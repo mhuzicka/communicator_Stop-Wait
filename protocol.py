@@ -43,7 +43,7 @@ class protocol:
                 self.datagram = pack('>H', line1) + pack('>H', custom_chsum)
         else:
             if not custom_chsum:
-                self.checksum = self.__compute_checksum(self.data)
+                self.checksum = self.__compute_checksum(pack('>H', line1) + self.data)
                 self.datagram = pack('>H', line1) + pack('>H', self.checksum) + self.data
             else:
                 self.datagram = pack('>H', line1) + pack('>H', custom_chsum) + self.data
@@ -65,6 +65,7 @@ class protocol:
     
 
     def __compute_checksum(self, Data: bytes) -> int:
+        """Vypocita 16-bitove CRC"""
         number = int.from_bytes(Data, "big") << 16
         data_bits = number.bit_length()
         if data_bits == 0:
@@ -93,7 +94,7 @@ class protocol:
 
         Returns self.data_type = None if checksum doesn't add up. Only self.sequence is a valid value then."""
 
-        if len(string) > 4 and self.__compute_checksum(string[4:]) != int.from_bytes(string[2:4], "big"):
+        if len(string) > 4 and self.__compute_checksum(string [:2] + string[4:]) != int.from_bytes(string[2:4], "big"):
             self.sequence = int.from_bytes(string[:2], "big") >> 5
             self.data_type = None
             return
@@ -102,6 +103,7 @@ class protocol:
 
 
     def __read_info(self, string: bytes) -> None:
+        """Ulozi udaje do premennych citatelnych programom."""
         self.checksum = int.from_bytes(string[2:4], "big")
 
         value_int = int.from_bytes(string[:2], "big")
@@ -126,6 +128,7 @@ class protocol:
 
 
 def change_frag_size(input: str) -> None:
+    """Funkcia sluzi na zmenu velkosti fragmentov pri posielanie. K tomu ma pristup iba vysielac (klient)."""
     global fragment_size
 
     if len(input) == 0:
