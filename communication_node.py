@@ -189,6 +189,10 @@ class communication_node():
             if cin == "MSG" or cin == "ERRMSG":
                 message = bytes(self.__await_input("Enter message to send"), "utf8")
 
+                # DOIMPLEMENTACIA
+                #message = self.__await_input("Enter message to send")
+                #message = bytes("___" + caesar(message) + "___", "utf8") # DOIMPLEMENTACIA
+
                 if len(message) > get_fragment_size():
                     send_buffer = message[ get_fragment_size() : ]
                     message = message[ : get_fragment_size() ]
@@ -716,3 +720,25 @@ def get_global_sequence() -> int:
 
 def elapsed_time_seconds(start: float) -> float:
     return time.time() - start
+
+# DOIMPLEMENTACIA
+def caesar(message: str, shift = 5): 
+    new_message = ""
+
+    for char in message:
+        assigned = False
+
+        if char.isalpha():
+            new_char = ord(char) + shift
+
+            if new_char > 90 and new_char < 96 or new_char > 122:
+                new_char -= 26
+            
+        
+            new_message += chr(new_char)
+            assigned = True
+        
+        if assigned == False:
+            new_message += char
+
+    return new_message
